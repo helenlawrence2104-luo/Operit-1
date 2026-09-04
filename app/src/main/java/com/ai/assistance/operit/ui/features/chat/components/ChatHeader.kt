@@ -8,6 +8,9 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.PictureInPicture
+import androidx.compose.material.icons.filled.Videocam
+import android.content.Intent
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
@@ -145,6 +148,32 @@ fun ChatHeader(
                                                         else
                                                                 MaterialTheme.colorScheme.onSurface
                                                                         .copy(alpha = 0.7f),
+                                        modifier = Modifier.size(20.dp)
+                                )
+                        }
+                }
+
+                // AI 实时视频通话入口按钮
+                val context = LocalContext.current
+                Box(
+                        modifier =
+                                Modifier.size(32.dp)
+                                        .background(
+                                                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.15f),
+                                                shape = CircleShape
+                                        )
+                ) {
+                        IconButton(
+                                onClick = {
+                                        val intent = Intent(context, com.ai.assistance.operit.ui.videocall.VideoCallActivity::class.java)
+                                        context.startActivity(intent)
+                                },
+                                modifier = Modifier.matchParentSize()
+                        ) {
+                                Icon(
+                                        imageVector = Icons.Default.Videocam,
+                                        contentDescription = "AI 实时视频通话",
+                                        tint = MaterialTheme.colorScheme.primary,
                                         modifier = Modifier.size(20.dp)
                                 )
                         }

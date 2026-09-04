@@ -36,7 +36,7 @@ class GeminiLiveVisionClient(private var apiKey: String) {
         systemInstruction: String = "你是一个正在与用户进行实时视频通话的AI助手。你可以实时看到用户摄像头拍摄的画面。请结合画面中的视觉细节，以亲切、口语化、简洁的语气与用户交流。"
     ): Result<String> = withContext(Dispatchers.IO) {
         try {
-            val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+            val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
             val partsArray = JSONArray()
 
             // 1. 如果有实时摄像头画面，压缩并转为 Base64 传入

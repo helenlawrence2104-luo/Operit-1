@@ -58,8 +58,10 @@ import androidx.compose.material.icons.filled.CallEnd
 import androidx.compose.material.icons.filled.Cameraswitch
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
+import androidx.compose.material.icons.filled.TouchApp
 import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -76,13 +78,14 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.ai.assistance.operit.api.gemini.GeminiLiveVisionClient
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import java.io.ByteArrayOutputStream
 import java.util.Locale
 
 enum class CallState {
     LISTENING,  // 聆听中
-    THINKING,   // 思考/看画面中
+    THINKING,   // 观察画面并思考中
     SPEAKING    // AI 正在说话
 }
 
@@ -106,12 +109,12 @@ class VideoCallActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private val callState = mutableStateOf(CallState.LISTENING)
     private val isMuted = mutableStateOf(false)
     private val recognizedText = mutableStateOf("")
-    private val aiResponseText = mutableStateOf("正在启动摄像头与 AI 通话...")
+    private val aiResponseText = mutableStateOf("正在启动摄像头...")
 
     private val sentenceBuffer = StringBuilder()
     private val sentenceDelimiters = setOf('。', '！', '？', '，', '；', '\n', '.', '!', '?', ';')
 
-    // 动态权限申请（解决没有授权导致相机打不开黑屏的问题）
+    // 动态申请相机和麦克风权限
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
@@ -119,22 +122,19 @@ class VideoCallActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         val audioGranted = permissions[Manifest.permission.RECORD_AUDIO] ?: false
 
         if (cameraGranted) {
-            openCameraIfReady()
+            openCameraAsync()
         } else {
-            Toast.makeText(this, "需要相机权限才能进行视频通话", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "未授予相机权限，无法显示画面", Toast.LENGTH_LONG).show()
         }
 
         if (audioGranted) {
-            initSpeechRecognizer()
-        } else {
-            Toast.makeText(this, "需要麦克风权限才能进行语音交流", Toast.LENGTH_SHORT).show()
+            setupSpeechRecognizer()
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 优先读取传入 Key，否则读取内置 Key
         val defaultEncodedKey = "QVEuQWI4Uk42THZrcm04Sk53cEtJenhIRWZWWVdkTEI4OFFzVktaWEVqRlFYTEpMN3ZzYkE="
         val fallbackKey = try {
             String(Base64.decode(defaultEncodedKey, Base64.DEFAULT)).trim()
@@ -145,7 +145,10 @@ class VideoCallActivity : ComponentActivity(), TextToSpeech.OnInitListener {
             ?: fallbackKey
 
         geminiClient = GeminiLiveVisionClient(apiKey)
-        tts = TextToSpeech(this, this)
+
+        try {
+            tts = TextToSpeech(this, this)
+        } catch (_: Exception) {}
 
         setContent {
             VideoCallScreen(
@@ -156,148 +159,156 @@ class VideoCallActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                 onToggleMute = { isMuted.value = !isMuted.value },
                 onSwitchCamera = { switchCamera() },
                 onEndCall = { finish() },
+                onOrbClick = { onOrbTapped() },
                 onTextureAvailable = { surface ->
                     previewSurface = surface
-                    checkAndRequestPermissions()
+                    checkPermissionsAndStart()
                 }
             )
         }
     }
 
-    private fun checkAndRequestPermissions() {
+    private fun checkPermissionsAndStart() {
         val hasCamera = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
         val hasAudio = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
 
         if (!hasCamera || !hasAudio) {
             permissionLauncher.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO))
         } else {
-            openCameraIfReady()
-            initSpeechRecognizer()
+            openCameraAsync()
+            setupSpeechRecognizer()
         }
     }
 
-    private fun openCameraIfReady() {
+    private fun openCameraAsync() {
         val surface = previewSurface ?: return
         startBackgroundThread()
 
-        val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
-        try {
-            val targetFacing = if (isUsingFrontCamera) CameraCharacteristics.LENS_FACING_FRONT else CameraCharacteristics.LENS_FACING_BACK
-            val cameraId = manager.cameraIdList.firstOrNull { id ->
-                manager.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING) == targetFacing
-            } ?: manager.cameraIdList.first()
+        backgroundHandler?.post {
+            try {
+                val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+                val targetFacing = if (isUsingFrontCamera) CameraCharacteristics.LENS_FACING_FRONT else CameraCharacteristics.LENS_FACING_BACK
+                val cameraId = manager.cameraIdList.firstOrNull { id ->
+                    manager.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING) == targetFacing
+                } ?: manager.cameraIdList.first()
 
-            imageReader = ImageReader.newInstance(640, 480, ImageFormat.YUV_420_888, 2).apply {
-                setOnImageAvailableListener({ reader ->
-                    val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
-                    val now = System.currentTimeMillis()
-                    if (now - lastFrameTime >= 600) {
-                        lastFrameTime = now
-                        latestBitmap = imageToBitmap(image)
-                    }
-                    image.close()
-                }, backgroundHandler)
-            }
-
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-                manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
-                    override fun onOpened(camera: CameraDevice) {
-                        cameraDevice = camera
-                        val captureRequestBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                            addTarget(surface)
-                            imageReader?.surface?.let { addTarget(it) }
+                imageReader?.close()
+                imageReader = ImageReader.newInstance(640, 480, ImageFormat.YUV_420_888, 2).apply {
+                    setOnImageAvailableListener({ reader ->
+                        val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+                        val now = System.currentTimeMillis()
+                        if (now - lastFrameTime >= 600) {
+                            lastFrameTime = now
+                            latestBitmap = imageToBitmap(image)
                         }
-                        camera.createCaptureSession(
-                            listOf(surface, imageReader!!.surface),
-                            object : CameraCaptureSession.StateCallback() {
-                                override fun onConfigured(session: CameraCaptureSession) {
-                                    captureSession = session
-                                    session.setRepeatingRequest(captureRequestBuilder.build(), null, backgroundHandler)
-                                    runOnUiThread {
-                                        if (aiResponseText.value.contains("启动")) {
-                                            aiResponseText.value = "AI 已看到您的画面，请直接对我说话！"
+                        image.close()
+                    }, backgroundHandler)
+                }
+
+                if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                    manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
+                        override fun onOpened(camera: CameraDevice) {
+                            cameraDevice = camera
+                            val captureRequestBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                                addTarget(surface)
+                                imageReader?.surface?.let { addTarget(it) }
+                            }
+                            camera.createCaptureSession(
+                                listOf(surface, imageReader!!.surface),
+                                object : CameraCaptureSession.StateCallback() {
+                                    override fun onConfigured(session: CameraCaptureSession) {
+                                        captureSession = session
+                                        session.setRepeatingRequest(captureRequestBuilder.build(), null, backgroundHandler)
+                                        runOnUiThread {
+                                            aiResponseText.value = "AI 已连接画面！请对我说话，或点击光球提问"
                                         }
                                     }
-                                }
-                                override fun onConfigureFailed(session: CameraCaptureSession) {}
-                            },
-                            backgroundHandler
-                        )
-                    }
+                                    override fun onConfigureFailed(session: CameraCaptureSession) {}
+                                },
+                                backgroundHandler
+                            )
+                        }
 
-                    override fun onDisconnected(camera: CameraDevice) {
-                        camera.close()
-                        cameraDevice = null
-                    }
+                        override fun onDisconnected(camera: CameraDevice) {
+                            camera.close()
+                            cameraDevice = null
+                        }
 
-                    override fun onError(camera: CameraDevice, error: Int) {
-                        camera.close()
-                        cameraDevice = null
-                    }
-                }, backgroundHandler)
+                        override fun onError(camera: CameraDevice, error: Int) {
+                            camera.close()
+                            cameraDevice = null
+                        }
+                    }, backgroundHandler)
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    Toast.makeText(this@VideoCallActivity, "启动相机失败: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+                }
             }
-        } catch (e: Exception) {
-            Toast.makeText(this, "相机启动异常: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
         }
     }
 
     private fun switchCamera() {
-        captureSession?.close()
-        cameraDevice?.close()
-        cameraDevice = null
-        captureSession = null
+        backgroundHandler?.post {
+            captureSession?.close()
+            cameraDevice?.close()
+            cameraDevice = null
+            captureSession = null
 
-        isUsingFrontCamera = !isUsingFrontCamera
-        openCameraIfReady()
+            isUsingFrontCamera = !isUsingFrontCamera
+            openCameraAsync()
+        }
     }
 
-    private fun initSpeechRecognizer() {
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            runOnUiThread {
-                if (aiResponseText.value.contains("启动")) {
-                    aiResponseText.value = "AI 画面已连接，点击光球即可提问！"
-                }
-            }
-            return
-        }
-
+    private fun setupSpeechRecognizer() {
         runOnUiThread {
-            speechRecognizer?.destroy()
-            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this).apply {
-                setRecognitionListener(object : RecognitionListener {
-                    override fun onReadyForSpeech(params: Bundle?) {}
-                    override fun onBeginningOfSpeech() {
-                        stopAndClearSpeech()
-                        callState.value = CallState.LISTENING
-                    }
-                    override fun onRmsChanged(rmsdB: Float) {}
-                    override fun onBufferReceived(buffer: ByteArray?) {}
-                    override fun onEndOfSpeech() {}
-                    override fun onError(error: Int) {
-                        // 自动保持持续倾听
-                        Handler(Looper.getMainLooper()).postDelayed({
-                            startListening()
-                        }, 500)
-                    }
-                    override fun onResults(results: Bundle?) {
-                        val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                        val text = matches?.firstOrNull() ?: ""
-                        if (text.isNotBlank() && !isMuted.value) {
-                            recognizedText.value = text
-                            processUserQueryStream(text)
-                        } else {
-                            startListening()
-                        }
-                    }
-                    override fun onPartialResults(partialResults: Bundle?) {}
-                    override fun onEvent(eventType: Int, params: Bundle?) {}
-                })
+            if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+                aiResponseText.value = "摄像头已就绪！点击中央光球让 AI 看画面回答"
+                return@runOnUiThread
             }
-            startListening()
+
+            try {
+                speechRecognizer?.destroy()
+                speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this).apply {
+                    setRecognitionListener(object : RecognitionListener {
+                        override fun onReadyForSpeech(params: Bundle?) {}
+                        override fun onBeginningOfSpeech() {
+                            stopAndClearSpeech()
+                            callState.value = CallState.LISTENING
+                        }
+                        override fun onRmsChanged(rmsdB: Float) {}
+                        override fun onBufferReceived(buffer: ByteArray?) {}
+                        override fun onEndOfSpeech() {}
+                        override fun onError(error: Int) {
+                            // 关键修复：绝对不在 onError 中同步死循环调用 startListening！
+                            // 延时 2 秒后再尝试，彻底杜绝主线程卡死卡顿！
+                            Handler(Looper.getMainLooper()).postDelayed({
+                                if (callState.value != CallState.SPEAKING && !isFinishing) {
+                                    startListeningSafely()
+                                }
+                            }, 2000)
+                        }
+                        override fun onResults(results: Bundle?) {
+                            val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                            val text = matches?.firstOrNull() ?: ""
+                            if (text.isNotBlank() && !isMuted.value) {
+                                recognizedText.value = text
+                                processQuery(text)
+                            } else {
+                                startListeningSafely()
+                            }
+                        }
+                        override fun onPartialResults(partialResults: Bundle?) {}
+                        override fun onEvent(eventType: Int, params: Bundle?) {}
+                    })
+                }
+                startListeningSafely()
+            } catch (_: Exception) {}
         }
     }
 
-    private fun startListening() {
+    private fun startListeningSafely() {
+        if (isFinishing || isMuted.value) return
         try {
             val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
@@ -307,12 +318,20 @@ class VideoCallActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         } catch (_: Exception) {}
     }
 
-    private fun processUserQueryStream(prompt: String) {
+    // 用户点击光球主动触发提问或主动让 AI 看画面
+    private fun onOrbTapped() {
+        stopAndClearSpeech()
+        callState.value = CallState.THINKING
+        aiResponseText.value = "正在分析画面..."
+        processQuery("请帮我看看当前画面里有什么，并用亲切生动的语音告诉我")
+    }
+
+    private fun processQuery(prompt: String) {
         callState.value = CallState.THINKING
         aiResponseText.value = "正在观察画面并思考..."
         sentenceBuffer.clear()
 
-        lifecycleScope.launch {
+        lifecycleScope.launch(Dispatchers.IO) {
             val result = geminiClient.streamAnalyzeFrameAndPrompt(
                 bitmap = latestBitmap,
                 prompt = prompt
@@ -339,7 +358,7 @@ class VideoCallActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                 runOnUiThread {
                     aiResponseText.value = "提示: ${err.localizedMessage}"
                     callState.value = CallState.LISTENING
-                    startListening()
+                    startListeningSafely()
                 }
             }
         }
@@ -374,13 +393,13 @@ class VideoCallActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                     runOnUiThread {
                         if (utteranceId == "FinalUtterance" && callState.value == CallState.SPEAKING) {
                             callState.value = CallState.LISTENING
-                            startListening()
+                            startListeningSafely()
                         }
                     }
                 }
                 override fun onError(utteranceId: String?) {}
             })
-            tts?.speak("你好，我已经看到你的画面了，请问有什么可以帮你？", TextToSpeech.QUEUE_FLUSH, null, "Welcome")
+            tts?.speak("你好，我已经连接到你的画面，请问有什么可以帮你？", TextToSpeech.QUEUE_FLUSH, null, "Welcome")
         }
     }
 
@@ -421,8 +440,8 @@ class VideoCallActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     override fun onDestroy() {
         super.onDestroy()
         stopAndClearSpeech()
-        tts?.shutdown()
-        speechRecognizer?.destroy()
+        try { tts?.shutdown() } catch (_: Exception) {}
+        try { speechRecognizer?.destroy() } catch (_: Exception) {}
         captureSession?.close()
         cameraDevice?.close()
         imageReader?.close()
@@ -439,12 +458,13 @@ fun VideoCallScreen(
     onToggleMute: () -> Unit,
     onSwitchCamera: () -> Unit,
     onEndCall: () -> Unit,
+    onOrbClick: () -> Unit,
     onTextureAvailable: (Surface) -> Unit
 ) {
     val infiniteTransition = rememberInfiniteTransition(label = "pulse")
     val scale by infiniteTransition.animateFloat(
         initialValue = 0.95f,
-        targetValue = 1.18f,
+        targetValue = 1.16f,
         animationSpec = infiniteRepeatable(
             animation = tween(1100, easing = FastOutSlowInEasing),
             repeatMode = RepeatMode.Reverse
@@ -453,7 +473,7 @@ fun VideoCallScreen(
     )
 
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
-        // 1. 全屏摄像头取景预览（采用标准的 TextureView，100% 避免 SurfaceView 黑屏遮挡问题）
+        // 1. 全屏摄像头取景预览（采用 TextureView，完美呈现画面）
         AndroidView(
             factory = { context ->
                 TextureView(context).apply {
@@ -470,7 +490,7 @@ fun VideoCallScreen(
             modifier = Modifier.fillMaxSize()
         )
 
-        // 2. 顶部状态与实时字幕显示卡片
+        // 2. 顶部状态与字幕提示卡片
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -487,7 +507,7 @@ fun VideoCallScreen(
                 Column {
                     Text(
                         text = when (callState) {
-                            CallState.LISTENING -> "🟢 正在聆听您的声音..."
+                            CallState.LISTENING -> "🟢 正在聆听您的声音 (可随时说话或点击光球)..."
                             CallState.THINKING -> "🟣 正在观察画面并思考..."
                             CallState.SPEAKING -> "🔵 AI 正在流式回答..."
                         },
@@ -513,7 +533,7 @@ fun VideoCallScreen(
             }
         }
 
-        // 3. 屏幕中央动态灵动光球动效
+        // 3. 屏幕中央动态灵动光球动效（点击光球可直接让 AI 看画面回答）
         val orbColors = when (callState) {
             CallState.LISTENING -> listOf(Color(0xFF4CAF50), Color(0xFF81C784))
             CallState.THINKING -> listOf(Color(0xFF9C27B0), Color(0xFFBA68C8))
@@ -523,22 +543,30 @@ fun VideoCallScreen(
         Box(
             modifier = Modifier
                 .align(Alignment.Center)
-                .size(136.dp)
+                .size(140.dp)
                 .scale(if (callState == CallState.SPEAKING || callState == CallState.THINKING) scale else 1.0f)
                 .clip(CircleShape)
                 .background(Brush.radialGradient(orbColors))
-                .border(2.dp, Color.White.copy(alpha = 0.6f), CircleShape),
+                .border(2.dp, Color.White.copy(alpha = 0.6f), CircleShape)
+                .clickable { onOrbClick() },
             contentAlignment = Alignment.Center
         ) {
-            Icon(
-                imageVector = Icons.Default.VolumeUp,
-                contentDescription = null,
-                tint = Color.White,
-                modifier = Modifier.size(46.dp)
-            )
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Icon(
+                    imageVector = Icons.Default.VolumeUp,
+                    contentDescription = null,
+                    tint = Color.White,
+                    modifier = Modifier.size(42.dp)
+                )
+                Text(
+                    text = "点击提问",
+                    color = Color.White,
+                    fontSize = 11.sp
+                )
+            }
         }
 
-        // 4. 底部通话控制栏
+        // 4. 底部通话控制栏（确保所有点击事件绝对灵敏、不卡顿）
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -547,32 +575,34 @@ fun VideoCallScreen(
             horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // 翻转镜头
+            // 翻转镜头按钮
             Box(
                 modifier = Modifier
                     .size(56.dp)
                     .clip(CircleShape)
-                    .background(Color(0x88000000))
-                    .clickable { onSwitchCamera() },
+                    .background(Color(0x88000000)),
                 contentAlignment = Alignment.Center
             ) {
-                Icon(Icons.Default.Cameraswitch, contentDescription = "翻转镜头", tint = Color.White)
+                IconButton(onClick = onSwitchCamera, modifier = Modifier.fillMaxSize()) {
+                    Icon(Icons.Default.Cameraswitch, contentDescription = "翻转镜头", tint = Color.White)
+                }
             }
 
-            // 静音开关
+            // 静音按钮
             Box(
                 modifier = Modifier
                     .size(56.dp)
                     .clip(CircleShape)
-                    .background(if (isMuted) Color.Red else Color(0x88000000))
-                    .clickable { onToggleMute() },
+                    .background(if (isMuted) Color.Red else Color(0x88000000)),
                 contentAlignment = Alignment.Center
             ) {
-                Icon(
-                    imageVector = if (isMuted) Icons.Default.MicOff else Icons.Default.Mic,
-                    contentDescription = "静音",
-                    tint = Color.White
-                )
+                IconButton(onClick = onToggleMute, modifier = Modifier.fillMaxSize()) {
+                    Icon(
+                        imageVector = if (isMuted) Icons.Default.MicOff else Icons.Default.Mic,
+                        contentDescription = "静音",
+                        tint = Color.White
+                    )
+                }
             }
 
             // 挂断按钮
@@ -580,11 +610,12 @@ fun VideoCallScreen(
                 modifier = Modifier
                     .size(68.dp)
                     .clip(CircleShape)
-                    .background(Color(0xFFE53935))
-                    .clickable { onEndCall() },
+                    .background(Color(0xFFE53935)),
                 contentAlignment = Alignment.Center
             ) {
-                Icon(Icons.Default.CallEnd, contentDescription = "挂断", tint = Color.White, modifier = Modifier.size(32.dp))
+                IconButton(onClick = onEndCall, modifier = Modifier.fillMaxSize()) {
+                    Icon(Icons.Default.CallEnd, contentDescription = "挂断", tint = Color.White, modifier = Modifier.size(34.dp))
+                }
             }
         }
     }

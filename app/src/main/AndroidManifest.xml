@@ -497,6 +497,13 @@
             android:permission="android.permission.BIND_VOICE_INTERACTION"
             android:exported="true" />
         
+        <!-- AI 实时视频通话页面 -->
+        <activity
+            android:name=".ui.videocall.VideoCallActivity"
+            android:screenOrientation="portrait"
+            android:theme="@style/Theme.Operit"
+            android:exported="false" />
+
     </application>
 
 </manifest>

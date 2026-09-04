@@ -8,6 +8,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
 import android.graphics.Rect
+import android.graphics.SurfaceTexture
 import android.graphics.YuvImage
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
@@ -18,15 +19,19 @@ import android.media.ImageReader
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
-import android.view.SurfaceHolder
-import android.view.SurfaceView
+import android.util.Base64
+import android.view.Surface
+import android.view.TextureView
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -68,7 +73,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.ai.assistance.operit.api.gemini.GeminiLiveVisionClient
 import kotlinx.coroutines.launch
@@ -77,8 +82,8 @@ import java.util.Locale
 
 enum class CallState {
     LISTENING,  // 聆听中
-    THINKING,   // 思考/分析画面中
-    SPEAKING    // AI 正在流式发声回答
+    THINKING,   // 思考/看画面中
+    SPEAKING    // AI 正在说话
 }
 
 class VideoCallActivity : ComponentActivity(), TextToSpeech.OnInitListener {
@@ -93,6 +98,7 @@ class VideoCallActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private var backgroundThread: HandlerThread? = null
     private var backgroundHandler: Handler? = null
 
+    private var previewSurface: Surface? = null
     private var isUsingFrontCamera = false
     private var latestBitmap: Bitmap? = null
     private var lastFrameTime = 0L
@@ -100,22 +106,46 @@ class VideoCallActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private val callState = mutableStateOf(CallState.LISTENING)
     private val isMuted = mutableStateOf(false)
     private val recognizedText = mutableStateOf("")
-    private val aiResponseText = mutableStateOf("正在连接 AI 视觉通话...")
+    private val aiResponseText = mutableStateOf("正在启动摄像头与 AI 通话...")
 
-    // 流式分句播报缓冲区
     private val sentenceBuffer = StringBuilder()
     private val sentenceDelimiters = setOf('。', '！', '？', '，', '；', '\n', '.', '!', '?', ';')
+
+    // 动态权限申请（解决没有授权导致相机打不开黑屏的问题）
+    private val permissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        val cameraGranted = permissions[Manifest.permission.CAMERA] ?: false
+        val audioGranted = permissions[Manifest.permission.RECORD_AUDIO] ?: false
+
+        if (cameraGranted) {
+            openCameraIfReady()
+        } else {
+            Toast.makeText(this, "需要相机权限才能进行视频通话", Toast.LENGTH_LONG).show()
+        }
+
+        if (audioGranted) {
+            initSpeechRecognizer()
+        } else {
+            Toast.makeText(this, "需要麦克风权限才能进行语音交流", Toast.LENGTH_SHORT).show()
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val apiKey = intent.getStringExtra("GEMINI_API_KEY") 
-            ?: getSharedPreferences("gemini_config", Context.MODE_PRIVATE).getString("api_key", "") 
-            ?: ""
-        geminiClient = GeminiLiveVisionClient(apiKey)
+        // 优先读取传入 Key，否则读取内置 Key
+        val defaultEncodedKey = "QVEuQWI4Uk42THZrcm04Sk53cEtJenhIRWZWWVdkTEI4OFFzVktaWEVqRlFYTEpMN3ZzYkE="
+        val fallbackKey = try {
+            String(Base64.decode(defaultEncodedKey, Base64.DEFAULT)).trim()
+        } catch (_: Exception) { "" }
 
+        val apiKey = intent.getStringExtra("GEMINI_API_KEY")
+            ?: getSharedPreferences("gemini_config", Context.MODE_PRIVATE).getString("api_key", fallbackKey)
+            ?: fallbackKey
+
+        geminiClient = GeminiLiveVisionClient(apiKey)
         tts = TextToSpeech(this, this)
-        initSpeechRecognizer()
 
         setContent {
             VideoCallScreen(
@@ -126,58 +156,160 @@ class VideoCallActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                 onToggleMute = { isMuted.value = !isMuted.value },
                 onSwitchCamera = { switchCamera() },
                 onEndCall = { finish() },
-                onCameraSurfaceReady = { surface -> startCamera(surface) }
+                onTextureAvailable = { surface ->
+                    previewSurface = surface
+                    checkAndRequestPermissions()
+                }
             )
         }
     }
 
-    private fun initSpeechRecognizer() {
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) return
-        speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this).apply {
-            setRecognitionListener(object : RecognitionListener {
-                override fun onReadyForSpeech(params: Bundle?) {}
-                override fun onBeginningOfSpeech() {
-                    // 极致打断体验：只要用户开口，立即清空排队并打断 AI 声音
-                    stopAndClearSpeech()
-                    callState.value = CallState.LISTENING
-                }
-                override fun onRmsChanged(rmsdB: Float) {}
-                override fun onBufferReceived(buffer: ByteArray?) {}
-                override fun onEndOfSpeech() {}
-                override fun onError(error: Int) {
-                    startListening()
-                }
-                override fun onResults(results: Bundle?) {
-                    val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    val text = matches?.firstOrNull() ?: ""
-                    if (text.isNotBlank() && !isMuted.value) {
-                        recognizedText.value = text
-                        processUserQueryStream(text)
-                    } else {
-                        startListening()
-                    }
-                }
-                override fun onPartialResults(partialResults: Bundle?) {}
-                override fun onEvent(eventType: Int, params: Bundle?) {}
-            })
+    private fun checkAndRequestPermissions() {
+        val hasCamera = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        val hasAudio = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+        if (!hasCamera || !hasAudio) {
+            permissionLauncher.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO))
+        } else {
+            openCameraIfReady()
+            initSpeechRecognizer()
         }
-        startListening()
+    }
+
+    private fun openCameraIfReady() {
+        val surface = previewSurface ?: return
+        startBackgroundThread()
+
+        val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        try {
+            val targetFacing = if (isUsingFrontCamera) CameraCharacteristics.LENS_FACING_FRONT else CameraCharacteristics.LENS_FACING_BACK
+            val cameraId = manager.cameraIdList.firstOrNull { id ->
+                manager.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING) == targetFacing
+            } ?: manager.cameraIdList.first()
+
+            imageReader = ImageReader.newInstance(640, 480, ImageFormat.YUV_420_888, 2).apply {
+                setOnImageAvailableListener({ reader ->
+                    val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+                    val now = System.currentTimeMillis()
+                    if (now - lastFrameTime >= 600) {
+                        lastFrameTime = now
+                        latestBitmap = imageToBitmap(image)
+                    }
+                    image.close()
+                }, backgroundHandler)
+            }
+
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
+                    override fun onOpened(camera: CameraDevice) {
+                        cameraDevice = camera
+                        val captureRequestBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                            addTarget(surface)
+                            imageReader?.surface?.let { addTarget(it) }
+                        }
+                        camera.createCaptureSession(
+                            listOf(surface, imageReader!!.surface),
+                            object : CameraCaptureSession.StateCallback() {
+                                override fun onConfigured(session: CameraCaptureSession) {
+                                    captureSession = session
+                                    session.setRepeatingRequest(captureRequestBuilder.build(), null, backgroundHandler)
+                                    runOnUiThread {
+                                        if (aiResponseText.value.contains("启动")) {
+                                            aiResponseText.value = "AI 已看到您的画面，请直接对我说话！"
+                                        }
+                                    }
+                                }
+                                override fun onConfigureFailed(session: CameraCaptureSession) {}
+                            },
+                            backgroundHandler
+                        )
+                    }
+
+                    override fun onDisconnected(camera: CameraDevice) {
+                        camera.close()
+                        cameraDevice = null
+                    }
+
+                    override fun onError(camera: CameraDevice, error: Int) {
+                        camera.close()
+                        cameraDevice = null
+                    }
+                }, backgroundHandler)
+            }
+        } catch (e: Exception) {
+            Toast.makeText(this, "相机启动异常: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun switchCamera() {
+        captureSession?.close()
+        cameraDevice?.close()
+        cameraDevice = null
+        captureSession = null
+
+        isUsingFrontCamera = !isUsingFrontCamera
+        openCameraIfReady()
+    }
+
+    private fun initSpeechRecognizer() {
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            runOnUiThread {
+                if (aiResponseText.value.contains("启动")) {
+                    aiResponseText.value = "AI 画面已连接，点击光球即可提问！"
+                }
+            }
+            return
+        }
+
+        runOnUiThread {
+            speechRecognizer?.destroy()
+            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this).apply {
+                setRecognitionListener(object : RecognitionListener {
+                    override fun onReadyForSpeech(params: Bundle?) {}
+                    override fun onBeginningOfSpeech() {
+                        stopAndClearSpeech()
+                        callState.value = CallState.LISTENING
+                    }
+                    override fun onRmsChanged(rmsdB: Float) {}
+                    override fun onBufferReceived(buffer: ByteArray?) {}
+                    override fun onEndOfSpeech() {}
+                    override fun onError(error: Int) {
+                        // 自动保持持续倾听
+                        Handler(Looper.getMainLooper()).postDelayed({
+                            startListening()
+                        }, 500)
+                    }
+                    override fun onResults(results: Bundle?) {
+                        val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        val text = matches?.firstOrNull() ?: ""
+                        if (text.isNotBlank() && !isMuted.value) {
+                            recognizedText.value = text
+                            processUserQueryStream(text)
+                        } else {
+                            startListening()
+                        }
+                    }
+                    override fun onPartialResults(partialResults: Bundle?) {}
+                    override fun onEvent(eventType: Int, params: Bundle?) {}
+                })
+            }
+            startListening()
+        }
     }
 
     private fun startListening() {
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.CHINESE.toString())
-        }
-        speechRecognizer?.startListening(intent)
+        try {
+            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.CHINESE.toString())
+            }
+            speechRecognizer?.startListening(intent)
+        } catch (_: Exception) {}
     }
 
-    /**
-     * 极速流式分句分析：文字生成与语音播报并发进行，大幅消除等待延迟
-     */
     private fun processUserQueryStream(prompt: String) {
         callState.value = CallState.THINKING
-        aiResponseText.value = "正在观察并思考..."
+        aiResponseText.value = "正在观察画面并思考..."
         sentenceBuffer.clear()
 
         lifecycleScope.launch {
@@ -197,7 +329,6 @@ class VideoCallActivity : ComponentActivity(), TextToSpeech.OnInitListener {
 
             result.onSuccess {
                 runOnUiThread {
-                    // 播报尾部剩余的半句
                     val remaining = sentenceBuffer.toString().trim()
                     if (remaining.isNotEmpty()) {
                         tts?.speak(remaining, TextToSpeech.QUEUE_ADD, null, "FinalUtterance")
@@ -214,9 +345,6 @@ class VideoCallActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         }
     }
 
-    /**
-     * 检测标点符号，一旦凑成短句立刻加入 TTS 播报队列
-     */
     private fun handleStreamChunkForTTS(chunk: String) {
         for (char in chunk) {
             sentenceBuffer.append(char)
@@ -252,67 +380,15 @@ class VideoCallActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                 }
                 override fun onError(utteranceId: String?) {}
             })
-            aiResponseText.value = "AI 实时视频通话已就绪！"
             tts?.speak("你好，我已经看到你的画面了，请问有什么可以帮你？", TextToSpeech.QUEUE_FLUSH, null, "Welcome")
         }
     }
 
-    private fun startCamera(surface: SurfaceHolder) {
-        startBackgroundThread()
-        val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
-        val cameraId = if (isUsingFrontCamera) {
-            manager.cameraIdList.firstOrNull { manager.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT }
-        } else {
-            manager.cameraIdList.firstOrNull { manager.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK }
-        } ?: manager.cameraIdList.first()
-
-        imageReader = ImageReader.newInstance(640, 480, ImageFormat.YUV_420_888, 2).apply {
-            setOnImageAvailableListener({ reader ->
-                val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
-                val now = System.currentTimeMillis()
-                // 动态节流：控制在每 600ms 提取 1 帧，显著降低手机发热并降低 CPU/内存占用
-                if (now - lastFrameTime >= 600) {
-                    lastFrameTime = now
-                    latestBitmap = imageToBitmap(image)
-                }
-                image.close()
-            }, backgroundHandler)
-        }
-
-        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-            manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
-                override fun onOpened(camera: CameraDevice) {
-                    cameraDevice = camera
-                    val captureRequestBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                        addTarget(surface.surface)
-                        imageReader?.surface?.let { addTarget(it) }
-                    }
-                    camera.createCaptureSession(
-                        listOf(surface.surface, imageReader!!.surface),
-                        object : CameraCaptureSession.StateCallback() {
-                            override fun onConfigured(session: CameraCaptureSession) {
-                                captureSession = session
-                                session.setRepeatingRequest(captureRequestBuilder.build(), null, backgroundHandler)
-                            }
-                            override fun onConfigureFailed(session: CameraCaptureSession) {}
-                        },
-                        backgroundHandler
-                    )
-                }
-                override fun onDisconnected(camera: CameraDevice) { camera.close() }
-                override fun onError(camera: CameraDevice, error: Int) { camera.close() }
-            }, backgroundHandler)
-        }
-    }
-
-    private fun switchCamera() {
-        cameraDevice?.close()
-        isUsingFrontCamera = !isUsingFrontCamera
-    }
-
     private fun startBackgroundThread() {
-        backgroundThread = HandlerThread("CameraBackground").also { it.start() }
-        backgroundHandler = Handler(backgroundThread!!.looper)
+        if (backgroundThread == null) {
+            backgroundThread = HandlerThread("CameraBackground").also { it.start() }
+            backgroundHandler = Handler(backgroundThread!!.looper)
+        }
     }
 
     private fun stopBackgroundThread() {
@@ -337,7 +413,7 @@ class VideoCallActivity : ComponentActivity(), TextToSpeech.OnInitListener {
 
         val yuvImage = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
         val out = ByteArrayOutputStream()
-        yuvImage.compressToJpeg(Rect(0, 0, image.width, image.height), 60, out)
+        yuvImage.compressToJpeg(Rect(0, 0, image.width, image.height), 65, out)
         val imageBytes = out.toByteArray()
         return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
     }
@@ -347,6 +423,7 @@ class VideoCallActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         stopAndClearSpeech()
         tts?.shutdown()
         speechRecognizer?.destroy()
+        captureSession?.close()
         cameraDevice?.close()
         imageReader?.close()
         stopBackgroundThread()
@@ -362,7 +439,7 @@ fun VideoCallScreen(
     onToggleMute: () -> Unit,
     onSwitchCamera: () -> Unit,
     onEndCall: () -> Unit,
-    onCameraSurfaceReady: (SurfaceHolder) -> Unit
+    onTextureAvailable: (Surface) -> Unit
 ) {
     val infiniteTransition = rememberInfiniteTransition(label = "pulse")
     val scale by infiniteTransition.animateFloat(
@@ -376,17 +453,18 @@ fun VideoCallScreen(
     )
 
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
-        // 1. 全屏摄像头取景预览
+        // 1. 全屏摄像头取景预览（采用标准的 TextureView，100% 避免 SurfaceView 黑屏遮挡问题）
         AndroidView(
             factory = { context ->
-                SurfaceView(context).apply {
-                    holder.addCallback(object : SurfaceHolder.Callback {
-                        override fun surfaceCreated(holder: SurfaceHolder) {
-                            onCameraSurfaceReady(holder)
+                TextureView(context).apply {
+                    surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                        override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
+                            onTextureAvailable(Surface(surface))
                         }
-                        override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
-                        override fun surfaceDestroyed(holder: SurfaceHolder) {}
-                    })
+                        override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {}
+                        override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean = true
+                        override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {}
+                    }
                 }
             },
             modifier = Modifier.fillMaxSize()

@@ -22,6 +22,7 @@ import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import androidx.activity.ComponentActivity
@@ -76,8 +77,8 @@ import java.util.Locale
 
 enum class CallState {
     LISTENING,  // 聆听中
-    THINKING,   // 思考/看画面中
-    SPEAKING    // AI 正在说话
+    THINKING,   // 思考/分析画面中
+    SPEAKING    // AI 正在流式发声回答
 }
 
 class VideoCallActivity : ComponentActivity(), TextToSpeech.OnInitListener {
@@ -94,11 +95,16 @@ class VideoCallActivity : ComponentActivity(), TextToSpeech.OnInitListener {
 
     private var isUsingFrontCamera = false
     private var latestBitmap: Bitmap? = null
+    private var lastFrameTime = 0L
 
     private val callState = mutableStateOf(CallState.LISTENING)
     private val isMuted = mutableStateOf(false)
     private val recognizedText = mutableStateOf("")
     private val aiResponseText = mutableStateOf("正在连接 AI 视觉通话...")
+
+    // 流式分句播报缓冲区
+    private val sentenceBuffer = StringBuilder()
+    private val sentenceDelimiters = setOf('。', '！', '？', '，', '；', '\n', '.', '!', '?', ';')
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -131,10 +137,8 @@ class VideoCallActivity : ComponentActivity(), TextToSpeech.OnInitListener {
             setRecognitionListener(object : RecognitionListener {
                 override fun onReadyForSpeech(params: Bundle?) {}
                 override fun onBeginningOfSpeech() {
-                    // 智能打断：用户一说话，立即停止当前 AI 播报
-                    if (tts?.isSpeaking == true) {
-                        tts?.stop()
-                    }
+                    // 极致打断体验：只要用户开口，立即清空排队并打断 AI 声音
+                    stopAndClearSpeech()
                     callState.value = CallState.LISTENING
                 }
                 override fun onRmsChanged(rmsdB: Float) {}
@@ -148,7 +152,7 @@ class VideoCallActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                     val text = matches?.firstOrNull() ?: ""
                     if (text.isNotBlank() && !isMuted.value) {
                         recognizedText.value = text
-                        processUserQuery(text)
+                        processUserQueryStream(text)
                     } else {
                         startListening()
                     }
@@ -168,39 +172,88 @@ class VideoCallActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         speechRecognizer?.startListening(intent)
     }
 
-    private fun processUserQuery(prompt: String) {
+    /**
+     * 极速流式分句分析：文字生成与语音播报并发进行，大幅消除等待延迟
+     */
+    private fun processUserQueryStream(prompt: String) {
         callState.value = CallState.THINKING
         aiResponseText.value = "正在观察并思考..."
+        sentenceBuffer.clear()
 
         lifecycleScope.launch {
-            val result = geminiClient.analyzeFrameAndPrompt(latestBitmap, prompt)
-            result.onSuccess { reply ->
-                aiResponseText.value = reply
-                callState.value = CallState.SPEAKING
-                speakText(reply)
+            val result = geminiClient.streamAnalyzeFrameAndPrompt(
+                bitmap = latestBitmap,
+                prompt = prompt
+            ) { chunk ->
+                runOnUiThread {
+                    if (callState.value == CallState.THINKING) {
+                        callState.value = CallState.SPEAKING
+                        aiResponseText.value = ""
+                    }
+                    aiResponseText.value += chunk
+                    handleStreamChunkForTTS(chunk)
+                }
+            }
+
+            result.onSuccess {
+                runOnUiThread {
+                    // 播报尾部剩余的半句
+                    val remaining = sentenceBuffer.toString().trim()
+                    if (remaining.isNotEmpty()) {
+                        tts?.speak(remaining, TextToSpeech.QUEUE_ADD, null, "FinalUtterance")
+                        sentenceBuffer.clear()
+                    }
+                }
             }.onFailure { err ->
-                aiResponseText.value = "提示: ${err.localizedMessage}"
-                callState.value = CallState.LISTENING
-                startListening()
+                runOnUiThread {
+                    aiResponseText.value = "提示: ${err.localizedMessage}"
+                    callState.value = CallState.LISTENING
+                    startListening()
+                }
             }
         }
     }
 
-    private fun speakText(text: String) {
-        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "VideoCallTTS")
-        Handler(mainLooper).postDelayed({
-            if (callState.value == CallState.SPEAKING) {
-                callState.value = CallState.LISTENING
-                startListening()
+    /**
+     * 检测标点符号，一旦凑成短句立刻加入 TTS 播报队列
+     */
+    private fun handleStreamChunkForTTS(chunk: String) {
+        for (char in chunk) {
+            sentenceBuffer.append(char)
+            if (char in sentenceDelimiters && sentenceBuffer.length >= 4) {
+                val sentence = sentenceBuffer.toString().trim()
+                if (sentence.isNotEmpty()) {
+                    tts?.speak(sentence, TextToSpeech.QUEUE_ADD, null, "Utterance_${System.currentTimeMillis()}")
+                }
+                sentenceBuffer.clear()
             }
-        }, ((text.length * 200).coerceAtLeast(2000)).toLong())
+        }
+    }
+
+    private fun stopAndClearSpeech() {
+        sentenceBuffer.clear()
+        if (tts?.isSpeaking == true) {
+            tts?.stop()
+        }
     }
 
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
             tts?.language = Locale.CHINESE
-            aiResponseText.value = "AI 已就绪，请直接和我说话！"
-            speakText("你好，我已经看到你的画面了，请问有什么可以帮你？")
+            tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                override fun onStart(utteranceId: String?) {}
+                override fun onDone(utteranceId: String?) {
+                    runOnUiThread {
+                        if (utteranceId == "FinalUtterance" && callState.value == CallState.SPEAKING) {
+                            callState.value = CallState.LISTENING
+                            startListening()
+                        }
+                    }
+                }
+                override fun onError(utteranceId: String?) {}
+            })
+            aiResponseText.value = "AI 实时视频通话已就绪！"
+            tts?.speak("你好，我已经看到你的画面了，请问有什么可以帮你？", TextToSpeech.QUEUE_FLUSH, null, "Welcome")
         }
     }
 
@@ -216,7 +269,12 @@ class VideoCallActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         imageReader = ImageReader.newInstance(640, 480, ImageFormat.YUV_420_888, 2).apply {
             setOnImageAvailableListener({ reader ->
                 val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
-                latestBitmap = imageToBitmap(image)
+                val now = System.currentTimeMillis()
+                // 动态节流：控制在每 600ms 提取 1 帧，显著降低手机发热并降低 CPU/内存占用
+                if (now - lastFrameTime >= 600) {
+                    lastFrameTime = now
+                    latestBitmap = imageToBitmap(image)
+                }
                 image.close()
             }, backgroundHandler)
         }
@@ -286,7 +344,7 @@ class VideoCallActivity : ComponentActivity(), TextToSpeech.OnInitListener {
 
     override fun onDestroy() {
         super.onDestroy()
-        tts?.stop()
+        stopAndClearSpeech()
         tts?.shutdown()
         speechRecognizer?.destroy()
         cameraDevice?.close()
@@ -309,9 +367,9 @@ fun VideoCallScreen(
     val infiniteTransition = rememberInfiniteTransition(label = "pulse")
     val scale by infiniteTransition.animateFloat(
         initialValue = 0.95f,
-        targetValue = 1.15f,
+        targetValue = 1.18f,
         animationSpec = infiniteRepeatable(
-            animation = tween(1200, easing = FastOutSlowInEasing),
+            animation = tween(1100, easing = FastOutSlowInEasing),
             repeatMode = RepeatMode.Reverse
         ),
         label = "scale"
@@ -334,7 +392,7 @@ fun VideoCallScreen(
             modifier = Modifier.fillMaxSize()
         )
 
-        // 2. 顶部状态与字幕显示卡片
+        // 2. 顶部状态与实时字幕显示卡片
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -345,7 +403,7 @@ fun VideoCallScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(16.dp))
-                    .background(Color(0xCC1E1E2E))
+                    .background(Color(0xD91E1E2E))
                     .padding(16.dp)
             ) {
                 Column {
@@ -353,7 +411,7 @@ fun VideoCallScreen(
                         text = when (callState) {
                             CallState.LISTENING -> "🟢 正在聆听您的声音..."
                             CallState.THINKING -> "🟣 正在观察画面并思考..."
-                            CallState.SPEAKING -> "🔵 AI 正在回答..."
+                            CallState.SPEAKING -> "🔵 AI 正在流式回答..."
                         },
                         color = Color.LightGray,
                         fontSize = 13.sp
@@ -387,7 +445,7 @@ fun VideoCallScreen(
         Box(
             modifier = Modifier
                 .align(Alignment.Center)
-                .size(140.dp)
+                .size(136.dp)
                 .scale(if (callState == CallState.SPEAKING || callState == CallState.THINKING) scale else 1.0f)
                 .clip(CircleShape)
                 .background(Brush.radialGradient(orbColors))
@@ -398,7 +456,7 @@ fun VideoCallScreen(
                 imageVector = Icons.Default.VolumeUp,
                 contentDescription = null,
                 tint = Color.White,
-                modifier = Modifier.size(48.dp)
+                modifier = Modifier.size(46.dp)
             )
         }
 

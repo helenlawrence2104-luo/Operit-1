@@ -213,6 +213,26 @@ jobs:
           chmod +x ./gradlew
           ./gradlew "$gradle_task" --stacktrace --no-daemon
 
+      - name: Sign APK with Personal Dedicated Release Keystore
+        shell: bash
+        run: |
+          set -euo pipefail
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -n 1)
+          echo "Using apksigner at: $APKSIGNER"
+          for apk in $(find app/build/outputs/apk -name "*.apk"); do
+            echo "Signing $apk with personal release keystore..."
+            "$APKSIGNER" sign \
+              --ks ci/keystore/operit_release.jks \
+              --ks-pass pass:operit123456 \
+              --key-pass pass:operit123456 \
+              --v1-signing-enabled true \
+              --v2-signing-enabled true \
+              --v3-signing-enabled true \
+              "$apk"
+            echo "Verifying signature of $apk..."
+            "$APKSIGNER" verify --verbose "$apk"
+          done
+
       - name: Upload Android reports
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6

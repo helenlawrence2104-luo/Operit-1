@@ -10,17 +10,19 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
+import java.io.InputStreamReader
 import java.util.concurrent.TimeUnit
 
 /**
- * Gemini 2.5 Flash 实时视觉多模态客户端
+ * Gemini 3.8 Flash 实时视觉多模态客户端（支持极速 SSE 流式输出）
  */
 class GeminiLiveVisionClient(private var apiKey: String) {
 
     private val client = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
         .build()
 
     fun updateApiKey(newKey: String) {
@@ -28,21 +30,22 @@ class GeminiLiveVisionClient(private var apiKey: String) {
     }
 
     /**
-     * 将实时相机画面与用户的语音提问一同发送给 Gemini 2.5 Flash 进行视觉理解
+     * SSE 流式分析画面与提问，每当模型生成若干字词即刻回调，极大降低首字发声延迟
      */
-    suspend fun analyzeFrameAndPrompt(
+    suspend fun streamAnalyzeFrameAndPrompt(
         bitmap: Bitmap?,
         prompt: String,
-        systemInstruction: String = "你是一个正在与用户进行实时视频通话的AI助手。你可以实时看到用户摄像头拍摄的画面。请结合画面中的视觉细节，以亲切、口语化、简洁的语气与用户交流。"
+        systemInstruction: String = "你是一个正在与用户进行实时视频通话的AI助手。你可以实时看到用户手机摄像头拍摄的画面。请结合画面中的视觉细节，像真人一样亲切、口语化、简洁地与用户交流。不要输出复杂的Markdown，直接说出易于语音播报的自然口语。",
+        onChunk: (String) -> Unit
     ): Result<String> = withContext(Dispatchers.IO) {
         try {
-            val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
+            val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse"
             val partsArray = JSONArray()
 
-            // 1. 如果有实时摄像头画面，压缩并转为 Base64 传入
+            // 1. 编码压缩当前相机画面
             if (bitmap != null) {
                 val outputStream = ByteArrayOutputStream()
-                bitmap.compress(Bitmap.CompressFormat.JPEG, 70, outputStream)
+                bitmap.compress(Bitmap.CompressFormat.JPEG, 65, outputStream)
                 val base64Image = Base64.encodeToString(outputStream.toByteArray(), Base64.NO_WRAP)
 
                 val imagePart = JSONObject().apply {
@@ -54,7 +57,7 @@ class GeminiLiveVisionClient(private var apiKey: String) {
                 partsArray.put(imagePart)
             }
 
-            // 2. 传入用户语音/文字提问
+            // 2. 传入提问
             val effectivePrompt = if (prompt.isBlank()) "请看看当前画面里有什么，并用简短生动的语言告诉我" else prompt
             partsArray.put(JSONObject().apply { put("text", effectivePrompt) })
 
@@ -81,25 +84,43 @@ class GeminiLiveVisionClient(private var apiKey: String) {
                 .build()
 
             val response = client.newCall(request).execute()
-            val responseBody = response.body?.string() ?: ""
-
             if (!response.isSuccessful) {
-                return@withContext Result.failure(Exception("API Error ${response.code}: $responseBody"))
+                val err = response.body?.string() ?: ""
+                return@withContext Result.failure(Exception("API 错误 ${response.code}: $err"))
             }
 
-            val jsonResponse = JSONObject(responseBody)
-            val candidates = jsonResponse.optJSONArray("candidates")
-            if (candidates != null && candidates.length() > 0) {
-                val firstCandidate = candidates.getJSONObject(0)
-                val content = firstCandidate.optJSONObject("content")
-                val parts = content?.optJSONArray("parts")
-                if (parts != null && parts.length() > 0) {
-                    val replyText = parts.getJSONObject(0).optString("text", "")
-                    return@withContext Result.success(replyText)
+            val fullTextBuilder = java.lang.StringBuilder()
+            val inputStream = response.body?.byteStream() ?: return@withContext Result.failure(Exception("无法读取响应流"))
+            val reader = BufferedReader(InputStreamReader(inputStream, Charsets.UTF_8))
+
+            var line: String?
+            while (reader.readLine().also { line = it } != null) {
+                val currentLine = line?.trim() ?: continue
+                if (currentLine.startsWith("data:")) {
+                    val jsonData = currentLine.removePrefix("data:").trim()
+                    if (jsonData.isEmpty()) continue
+                    try {
+                        val json = JSONObject(jsonData)
+                        val candidates = json.optJSONArray("candidates")
+                        if (candidates != null && candidates.length() > 0) {
+                            val candidate = candidates.getJSONObject(0)
+                            val content = candidate.optJSONObject("content")
+                            val parts = content?.optJSONArray("parts")
+                            if (parts != null && parts.length() > 0) {
+                                val textChunk = parts.getJSONObject(0).optString("text", "")
+                                if (textChunk.isNotEmpty()) {
+                                    fullTextBuilder.append(textChunk)
+                                    onChunk(textChunk)
+                                }
+                            }
+                        }
+                    } catch (_: Exception) {
+                        // 忽略单个 chunk 的解析异常
+                    }
                 }
             }
 
-            Result.failure(Exception("未能获取到有效回复"))
+            Result.success(fullTextBuilder.toString())
         } catch (e: Exception) {
             Result.failure(e)
         }
